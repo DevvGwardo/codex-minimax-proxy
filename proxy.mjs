@@ -186,7 +186,7 @@ function responsesRequestToChatCompletions(body) {
     }
   }
 
-  // Merge consecutive same-role user messages
+  // Merge consecutive same-role messages (user+user and plain assistant+assistant)
   const merged = [];
   for (const msg of fixed) {
     const prev = merged[merged.length - 1];
@@ -198,8 +198,31 @@ function responsesRequestToChatCompletions(body) {
       typeof msg.content === "string"
     ) {
       prev.content += "\n\n" + msg.content;
+    } else if (
+      prev &&
+      prev.role === msg.role &&
+      msg.role === "assistant" &&
+      !prev.tool_calls &&
+      !msg.tool_calls &&
+      typeof prev.content === "string" &&
+      typeof msg.content === "string"
+    ) {
+      // Merge consecutive plain-text assistant messages (no tool_calls)
+      prev.content += "\n\n" + msg.content;
     } else {
       merged.push(msg);
+    }
+  }
+
+  // Truncate large tool outputs in older messages to save context space.
+  // Terminal commands (cat heredocs, compile output, grep) can produce huge content
+  // that eats through the context window fast. Keep recent ones full.
+  const TOOL_OUTPUT_MAX = 2000; // chars
+  const KEEP_RECENT_FULL = 10; // keep last N messages at full size
+  for (let i = 0; i < Math.max(0, merged.length - KEEP_RECENT_FULL); i++) {
+    const msg = merged[i];
+    if (msg.role === "tool" && typeof msg.content === "string" && msg.content.length > TOOL_OUTPUT_MAX) {
+      msg.content = msg.content.slice(0, TOOL_OUTPUT_MAX) + "\n...[output truncated, " + (msg.content.length - TOOL_OUTPUT_MAX) + " chars removed]";
     }
   }
 
