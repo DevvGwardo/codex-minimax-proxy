@@ -510,7 +510,6 @@ function sendCompletion(res, events, responseId, model, fullText, toolCalls, out
   const trimmed = fullText.trim();
   if (trimmed) {
     res.write(events.textDone(msgOutIdx, 0, trimmed));
-    res.write(events.contentPartDone(msgOutIdx, 0, { type: "output_text", text: trimmed, annotations: [] }));
     const doneMsg = {
       type: "message",
       id: `msg_${uid()}`,
