@@ -87,7 +87,7 @@ function responsesRequestToChatCompletions(body) {
 
   // instructions -> user message (MiniMax doesn't support system role)
   if (body.instructions) {
-    messages.push({ role: "user", content: "[System Instructions] " + body.instructions + "\n\nIMPORTANT: Be efficient with tool calls. Do not repeat the same tool call. If you have enough information, respond directly instead of making more tool calls. Limit yourself to at most 3 tool calls per turn." });
+    messages.push({ role: "user", content: "[System Instructions] " + body.instructions + "\n\nNote: Be efficient with tool calls. Avoid repeating the same tool call unnecessarily." });
   }
 
   // input -> messages
@@ -313,7 +313,7 @@ function uid() {
   return crypto.randomBytes(12).toString("base64url");
 }
 
-function chatCompletionToResponse(cc, model, previousResponseId) {
+function chatCompletionToResponse(cc, model, previousResponseId, metadata) {
   const responseId = `resp_${uid()}`;
   const output = [];
 
@@ -391,6 +391,7 @@ function chatCompletionToResponse(cc, model, previousResponseId) {
     model: model || cc.model,
     output,
     previous_response_id: previousResponseId || null,
+    metadata: metadata || {},
     usage: translateUsage(cc.usage),
     incomplete_details: incompleteDetails,
   };
@@ -409,7 +410,7 @@ function translateUsage(u) {
 
 // --- Streaming translation ---
 
-function buildStreamingResponseEvents(responseId, model, previousResponseId) {
+function buildStreamingResponseEvents(responseId, model, previousResponseId, metadata) {
   const baseResponse = {
     id: responseId,
     object: "response",
@@ -418,6 +419,7 @@ function buildStreamingResponseEvents(responseId, model, previousResponseId) {
     model,
     output: [],
     previous_response_id: previousResponseId || null,
+    metadata: metadata || {},
     usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
   };
 
@@ -447,7 +449,7 @@ function buildStreamingResponseEvents(responseId, model, previousResponseId) {
   };
 }
 
-async function handleStreamingResponse(upstreamRes, res, model, previousResponseId) {
+async function handleStreamingResponse(upstreamRes, res, model, previousResponseId, metadata) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -455,7 +457,7 @@ async function handleStreamingResponse(upstreamRes, res, model, previousResponse
   });
 
   const responseId = `resp_${uid()}`;
-  const events = buildStreamingResponseEvents(responseId, model, previousResponseId);
+  const events = buildStreamingResponseEvents(responseId, model, previousResponseId, metadata);
 
   res.write(events.created());
   res.write(events.inProgress());
@@ -487,7 +489,7 @@ async function handleStreamingResponse(upstreamRes, res, model, previousResponse
         // Stream ended — send completion if not already sent
         if (!completionSent) {
           completionSent = true;
-          streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, null, null, previousResponseId);
+          streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, null, null, previousResponseId, metadata);
         }
         continue;
       }
@@ -531,7 +533,7 @@ async function handleStreamingResponse(upstreamRes, res, model, previousResponse
         // Check finish_reason on same chunk before continuing (don't skip it!)
         if (finishReason && !completionSent) {
           completionSent = true;
-          streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, parsed.usage, previousResponseId);
+          streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, parsed.usage, previousResponseId, metadata);
         }
         continue;
       }
@@ -566,7 +568,7 @@ async function handleStreamingResponse(upstreamRes, res, model, previousResponse
       // Check for finish
       if (finishReason && !completionSent) {
         completionSent = true;
-        streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, parsed.usage, previousResponseId);
+        streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, parsed.usage, previousResponseId, metadata);
       }
     }
   }
@@ -578,14 +580,14 @@ async function handleStreamingResponse(upstreamRes, res, model, previousResponse
     const wasGenerating = fullText.length > 0 || toolCalls.size > 0;
     const fallbackReason = wasGenerating ? "length" : "stop";
     console.warn(`[proxy] stream ended without finish_reason (wasGenerating=${wasGenerating}, reason=${fallbackReason})`);
-    streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, fallbackReason, null, previousResponseId);
+    streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, fallbackReason, null, previousResponseId, metadata);
   }
 
   res.end();
   return { responseId, output: streamOutput || [] };
 }
 
-function sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, usage, previousResponseId) {
+function sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, usage, previousResponseId, metadata) {
   // Finalize tool calls
   for (const [idx, tc] of toolCalls) {
     res.write(events.fnCallArgsDone(outputIndex + idx, tc.callId, tc.arguments));
@@ -604,13 +606,15 @@ function sendCompletion(res, events, responseId, model, fullText, toolCalls, out
   const msgOutIdx = outputIndex + toolCalls.size;
   const trimmed = fullText.trim();
   if (trimmed) {
+    const donePart = { type: "output_text", text: trimmed, annotations: [] };
     res.write(events.textDone(msgOutIdx, 0, trimmed));
+    res.write(events.contentPartDone(msgOutIdx, 0, donePart));
     const doneMsg = {
       type: "message",
       id: `msg_${uid()}`,
       status: "completed",
       role: "assistant",
-      content: [{ type: "output_text", text: trimmed, annotations: [] }],
+      content: [donePart],
     };
     res.write(events.outputItemDone(msgOutIdx, doneMsg));
   }
@@ -652,6 +656,7 @@ function sendCompletion(res, events, responseId, model, fullText, toolCalls, out
     model,
     output: finalOutput,
     previous_response_id: previousResponseId || null,
+    metadata: metadata || {},
     usage: translateUsage(usage),
     incomplete_details: incompleteDetails,
   };
@@ -763,7 +768,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (isStream) {
-        const { responseId: streamRespId, output: streamOutput } = await handleStreamingResponse(upstreamRes, res, body.model, body.previous_response_id);
+        const { responseId: streamRespId, output: streamOutput } = await handleStreamingResponse(upstreamRes, res, body.model, body.previous_response_id, body.metadata);
         storeResponse(streamRespId, {
           input: originalInput,
           output: streamOutput,
@@ -771,7 +776,7 @@ const server = http.createServer(async (req, res) => {
         });
       } else {
         const ccResponse = await upstreamRes.json();
-        const responsesResponse = chatCompletionToResponse(ccResponse, body.model, body.previous_response_id);
+        const responsesResponse = chatCompletionToResponse(ccResponse, body.model, body.previous_response_id, body.metadata);
         storeResponse(responsesResponse.id, {
           input: originalInput,
           output: responsesResponse.output,
