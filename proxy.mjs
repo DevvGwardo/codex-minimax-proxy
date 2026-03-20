@@ -23,6 +23,63 @@ if (!OPENROUTER_KEY) {
   console.warn("[proxy] OPENROUTER_API_KEY not set — web search requests will be skipped");
 }
 
+// --- Response store for previous_response_id support ---
+
+const responseStore = new Map();
+const STORE_TTL = 60 * 60 * 1000; // 1 hour
+const STORE_MAX = 500;
+
+function storeResponse(id, data) {
+  // Evict expired entries periodically
+  if (responseStore.size >= STORE_MAX) {
+    const now = Date.now();
+    for (const [key, val] of responseStore) {
+      if (now - val.storedAt > STORE_TTL) responseStore.delete(key);
+    }
+    // If still over limit, remove oldest
+    if (responseStore.size >= STORE_MAX) {
+      const oldest = responseStore.keys().next().value;
+      responseStore.delete(oldest);
+    }
+  }
+  responseStore.set(id, { ...data, storedAt: Date.now() });
+  console.log(`[proxy] stored response ${id} (store size: ${responseStore.size})`);
+}
+
+function resolveResponseChain(previousResponseId) {
+  // Walk the chain backwards, collecting input+output from each stored response
+  const chain = [];
+  let currentId = previousResponseId;
+  const visited = new Set();
+
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    const stored = responseStore.get(currentId);
+    if (!stored) {
+      console.warn(`[proxy] previous_response_id ${currentId} not found in store`);
+      break;
+    }
+    chain.unshift(stored); // prepend so oldest is first
+    currentId = stored.previousResponseId;
+  }
+
+  // Flatten: for each stored response, emit its input then its output
+  const items = [];
+  for (const entry of chain) {
+    if (Array.isArray(entry.input)) items.push(...entry.input);
+    if (Array.isArray(entry.output)) items.push(...entry.output);
+  }
+  return items;
+}
+
+function normalizeInputToArray(input) {
+  if (Array.isArray(input)) return input;
+  if (typeof input === "string") {
+    return [{ type: "message", role: "user", content: [{ type: "input_text", text: input }] }];
+  }
+  return [];
+}
+
 // --- Request translation: Responses API -> Chat Completions ---
 
 function responsesRequestToChatCompletions(body) {
@@ -121,6 +178,7 @@ function responsesRequestToChatCompletions(body) {
         let insertIdx = fixed.indexOf(lastTc) + 1;
         while (insertIdx < fixed.length && fixed[insertIdx].role === "tool") insertIdx++;
         fixed.splice(insertIdx, 0, msg);
+        messages[i] = null; // mark as consumed
       }
       // Otherwise drop it — can't send orphan tool results
     } else {
@@ -188,7 +246,8 @@ function responsesRequestToChatCompletions(body) {
 
   if (body.temperature != null) req.temperature = body.temperature;
   if (body.top_p != null) req.top_p = body.top_p;
-  if (body.max_output_tokens != null) req.max_tokens = body.max_output_tokens;
+  // Default to 16384 max tokens to prevent premature truncation
+  req.max_tokens = body.max_output_tokens || 16384;
 
   // Tools translation: flat -> nested, filter out unsupported types
   if (body.tools && body.tools.length > 0) {
@@ -231,7 +290,7 @@ function uid() {
   return crypto.randomBytes(12).toString("base64url");
 }
 
-function chatCompletionToResponse(cc, model) {
+function chatCompletionToResponse(cc, model, previousResponseId) {
   const responseId = `resp_${uid()}`;
   const output = [];
 
@@ -308,6 +367,7 @@ function chatCompletionToResponse(cc, model) {
     status,
     model: model || cc.model,
     output,
+    previous_response_id: previousResponseId || null,
     usage: translateUsage(cc.usage),
     incomplete_details: incompleteDetails,
   };
@@ -326,7 +386,7 @@ function translateUsage(u) {
 
 // --- Streaming translation ---
 
-function buildStreamingResponseEvents(responseId, model) {
+function buildStreamingResponseEvents(responseId, model, previousResponseId) {
   const baseResponse = {
     id: responseId,
     object: "response",
@@ -334,6 +394,7 @@ function buildStreamingResponseEvents(responseId, model) {
     status: "in_progress",
     model,
     output: [],
+    previous_response_id: previousResponseId || null,
     usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
   };
 
@@ -363,7 +424,7 @@ function buildStreamingResponseEvents(responseId, model) {
   };
 }
 
-async function handleStreamingResponse(upstreamRes, res, model) {
+async function handleStreamingResponse(upstreamRes, res, model, previousResponseId) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -371,7 +432,7 @@ async function handleStreamingResponse(upstreamRes, res, model) {
   });
 
   const responseId = `resp_${uid()}`;
-  const events = buildStreamingResponseEvents(responseId, model);
+  const events = buildStreamingResponseEvents(responseId, model, previousResponseId);
 
   res.write(events.created());
   res.write(events.inProgress());
@@ -386,6 +447,7 @@ async function handleStreamingResponse(upstreamRes, res, model) {
   const toolCalls = new Map(); // index -> { id, name, arguments }
   let outputIndex = 0;
   let buffer = "";
+  let streamOutput = null;
 
   const decoder = new TextDecoder();
 
@@ -402,7 +464,7 @@ async function handleStreamingResponse(upstreamRes, res, model) {
         // Stream ended — send completion if not already sent
         if (!completionSent) {
           completionSent = true;
-          sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, null, null);
+          streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, null, null, previousResponseId);
         }
         continue;
       }
@@ -420,7 +482,7 @@ async function handleStreamingResponse(upstreamRes, res, model) {
       if (!delta && !finishReason) continue;
 
       // Handle tool calls
-      if (delta.tool_calls) {
+      if (delta?.tool_calls) {
         for (const tc of delta.tool_calls) {
           const idx = tc.index ?? 0;
           if (!toolCalls.has(idx)) {
@@ -442,6 +504,11 @@ async function handleStreamingResponse(upstreamRes, res, model) {
             tc_data.arguments += tc.function.arguments;
             res.write(events.fnCallArgsDelta(outputIndex + idx, tc_data.callId, tc.function.arguments));
           }
+        }
+        // Check finish_reason on same chunk before continuing (don't skip it!)
+        if (finishReason && !completionSent) {
+          completionSent = true;
+          streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, parsed.usage, previousResponseId);
         }
         continue;
       }
@@ -476,7 +543,7 @@ async function handleStreamingResponse(upstreamRes, res, model) {
       // Check for finish
       if (finishReason && !completionSent) {
         completionSent = true;
-        sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, parsed.usage);
+        streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, parsed.usage, previousResponseId);
       }
     }
   }
@@ -484,13 +551,18 @@ async function handleStreamingResponse(upstreamRes, res, model) {
   // Fallback: if stream ended without finish_reason or [DONE]
   if (!completionSent) {
     completionSent = true;
-    sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, "stop", null);
+    // If we had content or tool calls in progress, this was likely truncated — signal incomplete
+    const wasGenerating = fullText.length > 0 || toolCalls.size > 0;
+    const fallbackReason = wasGenerating ? "length" : "stop";
+    console.warn(`[proxy] stream ended without finish_reason (wasGenerating=${wasGenerating}, reason=${fallbackReason})`);
+    streamOutput = sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, fallbackReason, null, previousResponseId);
   }
 
   res.end();
+  return { responseId, output: streamOutput || [] };
 }
 
-function sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, usage) {
+function sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, finishReason, usage, previousResponseId) {
   // Finalize tool calls
   for (const [idx, tc] of toolCalls) {
     res.write(events.fnCallArgsDone(outputIndex + idx, tc.callId, tc.arguments));
@@ -556,11 +628,13 @@ function sendCompletion(res, events, responseId, model, fullText, toolCalls, out
     status,
     model,
     output: finalOutput,
+    previous_response_id: previousResponseId || null,
     usage: translateUsage(usage),
     incomplete_details: incompleteDetails,
   };
 
   res.write(events.completed(finalResponse));
+  return finalOutput;
 }
 
 // --- HTTP server ---
@@ -597,6 +671,19 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid JSON" }));
       return;
+    }
+
+    // Save original input for response store (before chain resolution)
+    const originalInput = normalizeInputToArray(body.input);
+
+    // Resolve previous_response_id chain — prepend stored context
+    if (body.previous_response_id) {
+      const chainItems = resolveResponseChain(body.previous_response_id);
+      if (chainItems.length > 0) {
+        const currentInput = normalizeInputToArray(body.input);
+        body.input = [...chainItems, ...currentInput];
+        console.log(`[proxy] resolved previous_response_id: ${chainItems.length} items prepended (total input: ${body.input.length})`);
+      }
     }
 
     // Only route to OpenRouter if the ONLY tools are non-function (e.g. web_search alone)
@@ -653,10 +740,20 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (isStream) {
-        await handleStreamingResponse(upstreamRes, res, body.model);
+        const { responseId: streamRespId, output: streamOutput } = await handleStreamingResponse(upstreamRes, res, body.model, body.previous_response_id);
+        storeResponse(streamRespId, {
+          input: originalInput,
+          output: streamOutput,
+          previousResponseId: body.previous_response_id || null,
+        });
       } else {
         const ccResponse = await upstreamRes.json();
-        const responsesResponse = chatCompletionToResponse(ccResponse, body.model);
+        const responsesResponse = chatCompletionToResponse(ccResponse, body.model, body.previous_response_id);
+        storeResponse(responsesResponse.id, {
+          input: originalInput,
+          output: responsesResponse.output,
+          previousResponseId: body.previous_response_id || null,
+        });
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(responsesResponse));
       }
