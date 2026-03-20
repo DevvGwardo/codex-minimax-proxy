@@ -1,0 +1,19 @@
+{
+  "name": "codex-minimax-proxy",
+  "version": "1.0.0",
+  "description": "Proxy that translates OpenAI Responses API to Chat Completions API, enabling MiniMax M2.7 to work with OpenAI Codex CLI and Codex App",
+  "main": "proxy.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node proxy.mjs"
+  },
+  "keywords": [
+    "minimax",
+    "codex",
+    "openai",
+    "proxy",
+    "responses-api",
+    "chat-completions"
+  ],
+  "license": "MIT"
+}
