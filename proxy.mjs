@@ -14,13 +14,29 @@ const MINIMAX_KEY = process.env.MINIMAX_API_KEY;
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const OPENROUTER_SEARCH_MODEL = process.env.OPENROUTER_SEARCH_MODEL || "nvidia/nemotron-3-super-120b-a12b:free";
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_BASE = process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
+const ANTHROPIC_VERSION = "2023-06-01";
 
-if (!MINIMAX_KEY) {
-  console.error("MINIMAX_API_KEY env var is required");
+if (!MINIMAX_KEY && !ANTHROPIC_KEY) {
+  console.error("At least one of MINIMAX_API_KEY or ANTHROPIC_API_KEY env vars is required");
   process.exit(1);
+}
+if (!MINIMAX_KEY) {
+  console.warn("[proxy] MINIMAX_API_KEY not set — MiniMax routing disabled");
+}
+if (!ANTHROPIC_KEY) {
+  console.warn("[proxy] ANTHROPIC_API_KEY not set — Anthropic/Claude routing disabled");
 }
 if (!OPENROUTER_KEY) {
   console.warn("[proxy] OPENROUTER_API_KEY not set — web search requests will be skipped");
+}
+
+function isClaudeModel(model) {
+  if (!model) return false;
+  const m = model.toLowerCase();
+  return m.startsWith("claude") || m.includes("anthropic");
 }
 
 // --- Response store for previous_response_id support ---
@@ -344,6 +360,511 @@ function responsesRequestToChatCompletions(body) {
   }
 
   return req;
+}
+
+// --- Request translation: Responses API -> Anthropic Messages API ---
+
+function responsesRequestToAnthropicMessages(body) {
+  let systemPrompt = "";
+  const messages = [];
+
+  // instructions -> system prompt (Anthropic supports system as top-level param)
+  if (body.instructions) {
+    systemPrompt = body.instructions;
+  }
+
+  // input -> messages
+  if (typeof body.input === "string") {
+    messages.push({ role: "user", content: [{ type: "text", text: body.input }] });
+  } else if (Array.isArray(body.input)) {
+    let pendingToolUses = [];
+
+    for (const item of body.input) {
+      if (item.type === "message") {
+        let role = item.role;
+        // Map developer/system messages
+        if (role === "developer" || role === "system") {
+          // Append to system prompt
+          let text = "";
+          if (typeof item.content === "string") {
+            text = item.content;
+          } else if (Array.isArray(item.content)) {
+            text = item.content.map(b => b.text || "").filter(Boolean).join("\n");
+          }
+          if (text) {
+            systemPrompt = systemPrompt ? systemPrompt + "\n\n" + text : text;
+          }
+          continue;
+        }
+
+        const contentBlocks = [];
+        if (typeof item.content === "string") {
+          contentBlocks.push({ type: "text", text: item.content });
+        } else if (Array.isArray(item.content)) {
+          for (const block of item.content) {
+            if (block.type === "input_text" || block.type === "output_text") {
+              contentBlocks.push({ type: "text", text: block.text });
+            } else if (block.type === "input_image") {
+              const url = block.image_url || block.url;
+              if (url && url.startsWith("data:")) {
+                const match = url.match(/^data:(image\/\w+);base64,(.+)$/);
+                if (match) {
+                  contentBlocks.push({
+                    type: "image",
+                    source: { type: "base64", media_type: match[1], data: match[2] },
+                  });
+                }
+              } else if (url) {
+                contentBlocks.push({
+                  type: "image",
+                  source: { type: "url", url },
+                });
+              }
+            } else if (block.type === "text") {
+              contentBlocks.push({ type: "text", text: block.text });
+            }
+          }
+        }
+
+        if (role === "assistant") {
+          // Flush pending tool uses into assistant message
+          if (pendingToolUses.length > 0) {
+            const assistantContent = [...pendingToolUses];
+            if (contentBlocks.length > 0) assistantContent.push(...contentBlocks);
+            messages.push({ role: "assistant", content: assistantContent });
+            pendingToolUses = [];
+          } else if (contentBlocks.length > 0) {
+            messages.push({ role: "assistant", content: contentBlocks });
+          }
+        } else {
+          // Flush pending tool uses before user message
+          if (pendingToolUses.length > 0) {
+            messages.push({ role: "assistant", content: pendingToolUses });
+            pendingToolUses = [];
+          }
+          if (contentBlocks.length > 0) {
+            messages.push({ role: "user", content: contentBlocks });
+          }
+        }
+      } else if (item.type === "function_call") {
+        // Anthropic: tool_use blocks go in assistant messages
+        let parsedInput = {};
+        try {
+          parsedInput = JSON.parse(item.arguments || "{}");
+        } catch {
+          parsedInput = { input: item.arguments };
+        }
+        pendingToolUses.push({
+          type: "tool_use",
+          id: item.call_id || item.id || `toolu_${uid()}`,
+          name: item.name,
+          input: parsedInput,
+        });
+      } else if (item.type === "function_call_output") {
+        // Flush pending tool uses first
+        if (pendingToolUses.length > 0) {
+          messages.push({ role: "assistant", content: pendingToolUses });
+          pendingToolUses = [];
+        }
+        // Anthropic: tool_result blocks go in user messages
+        messages.push({
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: item.call_id,
+            content: item.output || "",
+          }],
+        });
+      } else if (item.type === "reasoning") {
+        // Skip reasoning items
+      }
+    }
+
+    // Flush remaining tool uses
+    if (pendingToolUses.length > 0) {
+      messages.push({ role: "assistant", content: pendingToolUses });
+    }
+  }
+
+  // Anthropic requires alternating user/assistant messages. Merge consecutive same-role.
+  const merged = [];
+  for (const msg of messages) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.role === msg.role) {
+      // Merge content arrays
+      const prevContent = Array.isArray(prev.content) ? prev.content : [{ type: "text", text: prev.content }];
+      const curContent = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content }];
+      prev.content = [...prevContent, ...curContent];
+    } else {
+      merged.push({ ...msg });
+    }
+  }
+
+  // Anthropic requires first message to be from user
+  if (merged.length > 0 && merged[0].role !== "user") {
+    merged.unshift({ role: "user", content: [{ type: "text", text: "Begin." }] });
+  }
+
+  // Ensure last message is from user (if assistant is last, add a continue prompt)
+  // This is not strictly required by Anthropic but helps with proper responses
+
+  // Context trimming for very long conversations
+  const MAX_MESSAGES = 80;
+  let finalMessages = merged;
+  if (merged.length > MAX_MESSAGES) {
+    const head = merged.slice(0, 2);
+    let tail = merged.slice(-(MAX_MESSAGES - 3));
+    // Ensure tail starts with user
+    while (tail.length > 0 && tail[0].role !== "user") tail.shift();
+    finalMessages = [
+      ...head,
+      { role: "user", content: [{ type: "text", text: "[Earlier conversation trimmed. Continue with the current task.]" }] },
+      { role: "assistant", content: [{ type: "text", text: "Understood. Continuing with the current task." }] },
+      ...tail,
+    ];
+    console.log(`[proxy] anthropic: trimmed ${merged.length} -> ${finalMessages.length} messages`);
+  }
+
+  // Truncate large tool results in older messages
+  const TOOL_OUTPUT_MAX = 4000;
+  const KEEP_RECENT_FULL = 10;
+  for (let i = 0; i < Math.max(0, finalMessages.length - KEEP_RECENT_FULL); i++) {
+    const msg = finalMessages[i];
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === "tool_result" && typeof block.content === "string" && block.content.length > TOOL_OUTPUT_MAX) {
+          block.content = block.content.slice(0, TOOL_OUTPUT_MAX) + "\n...[output truncated]";
+        }
+      }
+    }
+  }
+
+  const req = {
+    model: body.model && isClaudeModel(body.model) ? body.model : ANTHROPIC_MODEL,
+    max_tokens: body.max_output_tokens || 16384,
+    messages: finalMessages,
+  };
+
+  if (systemPrompt) {
+    req.system = systemPrompt;
+  }
+
+  if (body.stream) {
+    req.stream = true;
+  }
+
+  if (body.temperature != null) req.temperature = body.temperature;
+  if (body.top_p != null) req.top_p = body.top_p;
+
+  // Tools translation for Anthropic format
+  if (body.tools && body.tools.length > 0) {
+    const supported = body.tools.filter((t) => t.type === "function");
+    if (supported.length > 0) {
+      req.tools = supported.map((t) => {
+        const fn = t.function || t;
+        return {
+          name: fn.name,
+          description: fn.description || "",
+          input_schema: fn.parameters || { type: "object", properties: {} },
+        };
+      });
+    }
+  }
+
+  return req;
+}
+
+// --- Response translation: Anthropic Messages -> Responses API ---
+
+function anthropicResponseToResponse(anthResp, model, previousResponseId, metadata) {
+  const responseId = `resp_${uid()}`;
+  const output = [];
+
+  if (anthResp.content) {
+    for (const block of anthResp.content) {
+      if (block.type === "tool_use") {
+        output.push({
+          type: "function_call",
+          id: `fc_${uid()}`,
+          call_id: block.id,
+          name: block.name,
+          arguments: JSON.stringify(block.input || {}),
+          status: "completed",
+        });
+      } else if (block.type === "text") {
+        const text = (block.text || "").replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
+        if (text) {
+          output.push({
+            type: "message",
+            id: `msg_${uid()}`,
+            status: "completed",
+            role: "assistant",
+            content: [{ type: "output_text", text, annotations: [] }],
+          });
+        }
+      }
+    }
+  }
+
+  let status = "completed";
+  let incompleteDetails = null;
+  if (anthResp.stop_reason === "max_tokens") {
+    status = "incomplete";
+    incompleteDetails = { reason: "max_output_tokens" };
+  }
+
+  return {
+    id: responseId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status,
+    model: model || anthResp.model,
+    output,
+    previous_response_id: previousResponseId || null,
+    metadata: metadata || {},
+    usage: translateAnthropicUsage(anthResp.usage),
+    incomplete_details: incompleteDetails,
+  };
+}
+
+function translateAnthropicUsage(u) {
+  if (!u) return { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+  const input = u.input_tokens || 0;
+  const output = u.output_tokens || 0;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: input + output,
+    input_tokens_details: { cached_tokens: u.cache_read_input_tokens || 0 },
+    output_tokens_details: { reasoning_tokens: 0 },
+  };
+}
+
+// --- Anthropic Streaming translation ---
+
+async function handleAnthropicStreamingResponse(upstreamRes, res, model, previousResponseId, metadata) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  const responseId = `resp_${uid()}`;
+  const events = buildStreamingResponseEvents(responseId, model, previousResponseId, metadata);
+
+  res.write(events.created());
+  res.write(events.inProgress());
+
+  let fullText = "";
+  let messageStarted = false;
+  let completionSent = false;
+  const toolCalls = new Map(); // block index -> { id, callId, name, arguments, outputIdx }
+  let outputIndex = 0;
+  let textOutputIdx = -1;
+  let buffer = "";
+  let streamOutput = null;
+  let currentBlockIdx = -1;
+  let currentBlockType = null;
+  let usage = null;
+  let stopReason = null;
+
+  const decoder = new TextDecoder();
+
+  for await (const chunk of upstreamRes.body) {
+    buffer += decoder.decode(chunk, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6).trim();
+      if (!data || data === "[DONE]") continue;
+
+      let parsed;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        continue;
+      }
+
+      const eventType = parsed.type;
+
+      if (eventType === "message_start") {
+        // Contains message metadata and usage
+        if (parsed.message?.usage) {
+          usage = parsed.message.usage;
+        }
+      } else if (eventType === "content_block_start") {
+        currentBlockIdx = parsed.index ?? 0;
+        const block = parsed.content_block;
+
+        if (block?.type === "tool_use") {
+          currentBlockType = "tool_use";
+          const callId = block.id || `toolu_${uid()}`;
+          const fcId = `fc_${uid()}`;
+          const tcOutIdx = messageStarted ? outputIndex + currentBlockIdx + 1 : outputIndex + currentBlockIdx;
+          toolCalls.set(currentBlockIdx, { id: fcId, callId, name: block.name || "", arguments: "", outputIdx: tcOutIdx });
+          const item = {
+            type: "function_call",
+            id: fcId,
+            call_id: callId,
+            name: block.name || "",
+            arguments: "",
+            status: "in_progress",
+          };
+          res.write(events.outputItemAdded(tcOutIdx, item));
+        } else if (block?.type === "text") {
+          currentBlockType = "text";
+          if (!messageStarted) {
+            messageStarted = true;
+            textOutputIdx = outputIndex;
+            res.write(events.outputItemAdded(textOutputIdx, {
+              type: "message", id: `msg_${uid()}`, status: "in_progress", role: "assistant", content: [],
+            }));
+            res.write(events.contentPartAdded(textOutputIdx, 0, { type: "output_text", text: "", annotations: [] }));
+            // Subsequent tool blocks need higher indices
+            outputIndex++;
+          }
+        } else if (block?.type === "thinking") {
+          currentBlockType = "thinking";
+        }
+      } else if (eventType === "content_block_delta") {
+        const delta = parsed.delta;
+        if (!delta) continue;
+
+        if (delta.type === "text_delta" && delta.text) {
+          fullText += delta.text;
+          if (textOutputIdx >= 0) {
+            res.write(events.textDelta(textOutputIdx, 0, delta.text));
+          }
+        } else if (delta.type === "input_json_delta" && delta.partial_json != null) {
+          // Tool call arguments streaming
+          const tc = toolCalls.get(currentBlockIdx);
+          if (tc) {
+            tc.arguments += delta.partial_json;
+            res.write(events.fnCallArgsDelta(tc.outputIdx, tc.callId, delta.partial_json));
+          }
+        }
+        // Skip thinking_delta
+      } else if (eventType === "content_block_stop") {
+        currentBlockType = null;
+      } else if (eventType === "message_delta") {
+        if (parsed.delta?.stop_reason) {
+          stopReason = parsed.delta.stop_reason;
+        }
+        if (parsed.usage) {
+          usage = { ...usage, ...parsed.usage };
+        }
+      } else if (eventType === "message_stop") {
+        if (!completionSent) {
+          completionSent = true;
+          const finishReason = stopReason === "max_tokens" ? "length" : "stop";
+          streamOutput = sendAnthropicCompletion(res, events, responseId, model, fullText, toolCalls, textOutputIdx, finishReason, usage, previousResponseId, metadata);
+        }
+      }
+    }
+  }
+
+  // Fallback if stream ended without message_stop
+  if (!completionSent) {
+    completionSent = true;
+    const wasGenerating = fullText.length > 0 || toolCalls.size > 0;
+    const fallbackReason = wasGenerating ? "length" : "stop";
+    console.warn(`[proxy] anthropic stream ended without message_stop (reason=${fallbackReason})`);
+    streamOutput = sendAnthropicCompletion(res, events, responseId, model, fullText, toolCalls, textOutputIdx, fallbackReason, usage, previousResponseId, metadata);
+  }
+
+  res.end();
+  return { responseId, output: streamOutput || [] };
+}
+
+function sendAnthropicCompletion(res, events, responseId, model, fullText, toolCalls, textOutputIdx, finishReason, usage, previousResponseId, metadata) {
+  // Finalize tool calls
+  for (const [idx, tc] of toolCalls) {
+    res.write(events.fnCallArgsDone(tc.outputIdx, tc.callId, tc.arguments));
+    const doneItem = {
+      type: "function_call",
+      id: tc.id,
+      call_id: tc.callId,
+      name: tc.name,
+      arguments: tc.arguments,
+      status: "completed",
+    };
+    res.write(events.outputItemDone(tc.outputIdx, doneItem));
+  }
+
+  // Finalize text
+  const trimmed = fullText.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim();
+  const msgOutIdx = textOutputIdx >= 0 ? textOutputIdx : 0;
+  if (trimmed) {
+    const donePart = { type: "output_text", text: trimmed, annotations: [] };
+    res.write(events.textDone(msgOutIdx, 0, trimmed));
+    res.write(events.contentPartDone(msgOutIdx, 0, donePart));
+    const doneMsg = {
+      type: "message",
+      id: `msg_${uid()}`,
+      status: "completed",
+      role: "assistant",
+      content: [donePart],
+    };
+    res.write(events.outputItemDone(msgOutIdx, doneMsg));
+  }
+
+  // Build final output
+  const outputItems = [];
+  for (const [idx, tc] of toolCalls) {
+    outputItems.push({
+      sortIdx: tc.outputIdx,
+      item: {
+        type: "function_call",
+        id: tc.id,
+        call_id: tc.callId,
+        name: tc.name,
+        arguments: tc.arguments,
+        status: "completed",
+      },
+    });
+  }
+  if (trimmed) {
+    outputItems.push({
+      sortIdx: msgOutIdx,
+      item: {
+        type: "message",
+        id: `msg_${uid()}`,
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: trimmed, annotations: [] }],
+      },
+    });
+  }
+  outputItems.sort((a, b) => a.sortIdx - b.sortIdx);
+  const finalOutput = outputItems.map(o => o.item);
+
+  let status = "completed";
+  let incompleteDetails = null;
+  if (finishReason === "length") {
+    status = "incomplete";
+    incompleteDetails = { reason: "max_output_tokens" };
+  }
+
+  const anthUsage = translateAnthropicUsage(usage);
+
+  const finalResponse = {
+    id: responseId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status,
+    model,
+    output: finalOutput,
+    previous_response_id: previousResponseId || null,
+    metadata: metadata || {},
+    usage: anthUsage,
+    incomplete_details: incompleteDetails,
+  };
+
+  res.write(events.completed(finalResponse));
+  return finalOutput;
 }
 
 // --- Response translation: Chat Completions -> Responses API ---
@@ -729,13 +1250,19 @@ const server = http.createServer(async (req, res) => {
 
   // Models endpoint
   if (req.method === "GET" && (req.url === "/v1/models" || req.url === "/models")) {
+    const models = [];
+    if (MINIMAX_KEY) {
+      models.push({ id: "MiniMax-M2.7", object: "model", owned_by: "minimax" });
+    }
+    if (ANTHROPIC_KEY) {
+      models.push(
+        { id: "claude-opus-4-20250514", object: "model", owned_by: "anthropic" },
+        { id: "claude-sonnet-4-20250514", object: "model", owned_by: "anthropic" },
+        { id: "claude-haiku-4-20250514", object: "model", owned_by: "anthropic" },
+      );
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        object: "list",
-        data: [{ id: "MiniMax-M2.7", object: "model", owned_by: "minimax" }],
-      })
-    );
+    res.end(JSON.stringify({ object: "list", data: models }));
     return;
   }
 
@@ -785,12 +1312,89 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // Determine routing: Anthropic, OpenRouter (web search), or MiniMax
+    const useAnthropic = isClaudeModel(body.model) && ANTHROPIC_KEY;
+
     // Only route to OpenRouter if the ONLY tools are non-function (e.g. web_search alone)
-    // If there are function tools too, use MiniMax and just strip web_search
+    // If there are function tools too, use primary provider and just strip web_search
     const hasWebSearch = body.tools?.some((t) => t.type === "web_search");
     const hasFunctionTools = body.tools?.some((t) => t.type === "function");
-    const useOpenRouter = hasWebSearch && !hasFunctionTools && OPENROUTER_KEY;
+    const useOpenRouter = !useAnthropic && hasWebSearch && !hasFunctionTools && OPENROUTER_KEY;
 
+    // Hard circuit breaker: strip tools entirely to force text response
+    let stripTools = false;
+    if (body.previous_response_id) {
+      const prevStored = responseStore.get(body.previous_response_id);
+      const consecutiveTc = prevStored?.consecutiveToolCalls || 0;
+      if (consecutiveTc >= MAX_CONSECUTIVE_TOOL_CALLS + 3) {
+        console.warn(`[proxy] HARD CIRCUIT BREAKER: stripping all tools to force text response`);
+        stripTools = true;
+      }
+    }
+
+    // --- Anthropic route ---
+    if (useAnthropic) {
+      const anthReq = responsesRequestToAnthropicMessages(body);
+      const isStream = body.stream || false;
+
+      if (stripTools) {
+        delete anthReq.tools;
+      }
+
+      console.log(`[proxy] anthropic(${anthReq.model}) | stream=${isStream} | messages=${anthReq.messages.length} | roles=[${anthReq.messages.map(m => m.role).join(",")}]`);
+
+      try {
+        const upstreamRes = await fetch(`${ANTHROPIC_BASE}/v1/messages`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_KEY,
+            "anthropic-version": ANTHROPIC_VERSION,
+          },
+          body: JSON.stringify(anthReq),
+        });
+
+        if (!upstreamRes.ok) {
+          const errText = await upstreamRes.text();
+          console.error(`[proxy] anthropic error: ${upstreamRes.status} ${errText}`);
+          if (!res.headersSent) {
+            res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+            res.end(errText);
+          }
+          return;
+        }
+
+        if (isStream) {
+          const { responseId: streamRespId, output: streamOutput } = await handleAnthropicStreamingResponse(upstreamRes, res, body.model, body.previous_response_id, body.metadata);
+          storeResponse(streamRespId, {
+            input: originalInput,
+            output: streamOutput,
+            previousResponseId: body.previous_response_id || null,
+          });
+        } else {
+          const anthResponse = await upstreamRes.json();
+          const responsesResponse = anthropicResponseToResponse(anthResponse, body.model, body.previous_response_id, body.metadata);
+          storeResponse(responsesResponse.id, {
+            input: originalInput,
+            output: responsesResponse.output,
+            previousResponseId: body.previous_response_id || null,
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(responsesResponse));
+        }
+      } catch (err) {
+        console.error(`[proxy] anthropic fetch error:`, err.message);
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: err.message } }));
+        } else {
+          res.end();
+        }
+      }
+      return;
+    }
+
+    // --- MiniMax / OpenRouter route ---
     const chatReq = responsesRequestToChatCompletions(body);
     // Always override model to MiniMax-M2.7 (subagents may send different model names)
     chatReq.model = "MiniMax-M2.7";
@@ -811,15 +1415,9 @@ const server = http.createServer(async (req, res) => {
       routeLabel = "minimax";
     }
 
-    // Hard circuit breaker: strip tools entirely to force text response
-    if (body.previous_response_id) {
-      const prevStored = responseStore.get(body.previous_response_id);
-      const consecutiveTc = prevStored?.consecutiveToolCalls || 0;
-      if (consecutiveTc >= MAX_CONSECUTIVE_TOOL_CALLS + 3) {
-        console.warn(`[proxy] HARD CIRCUIT BREAKER: stripping all tools to force text response`);
-        delete chatReq.tools;
-        delete chatReq.tool_choice;
-      }
+    if (stripTools) {
+      delete chatReq.tools;
+      delete chatReq.tool_choice;
     }
 
     console.log(`[proxy] ${routeLabel} | stream=${isStream} | messages=${chatReq.messages.length}${hasWebSearch ? " | web_search" : ""} | roles=[${chatReq.messages.map(m => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`);
@@ -1069,6 +1667,7 @@ server.requestTimeout = 0;
 
 server.listen(PORT, () => {
   console.log(`[codex-minimax-proxy] Listening on http://localhost:${PORT}`);
-  console.log(`[codex-minimax-proxy] Primary: MiniMax @ ${MINIMAX_BASE}`);
-  console.log(`[codex-minimax-proxy] Search:  ${OPENROUTER_KEY ? `OpenRouter (${OPENROUTER_SEARCH_MODEL})` : "DISABLED (no OPENROUTER_API_KEY)"}`);
+  console.log(`[codex-minimax-proxy] MiniMax:    ${MINIMAX_KEY ? `ENABLED @ ${MINIMAX_BASE}` : "DISABLED (no MINIMAX_API_KEY)"}`);
+  console.log(`[codex-minimax-proxy] Anthropic:  ${ANTHROPIC_KEY ? `ENABLED @ ${ANTHROPIC_BASE} (default: ${ANTHROPIC_MODEL})` : "DISABLED (no ANTHROPIC_API_KEY)"}`);
+  console.log(`[codex-minimax-proxy] Search:     ${OPENROUTER_KEY ? `OpenRouter (${OPENROUTER_SEARCH_MODEL})` : "DISABLED (no OPENROUTER_API_KEY)"}`);
 });
