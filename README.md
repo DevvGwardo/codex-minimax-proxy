@@ -25,6 +25,16 @@ Codex CLI/App  -->  /v1/responses  -->  [proxy]  -->  /v1/messages         -->  
 - Circuit breaker for tool-call loops
 - Zero dependencies — pure Node.js
 
+## Claude Subscription Users (Pro/Max)
+
+> **If you have a Claude Pro or Max subscription**, you don't need this proxy for Claude. Your subscription includes **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** — an agentic coding tool with tool calling, file editing, terminal access, and sub-agents built in. Just run:
+>
+> ```bash
+> claude
+> ```
+>
+> This proxy's Anthropic integration is for users who want to use Claude models inside **OpenAI Codex CLI** specifically, which requires the **Anthropic API** (separate billing from your subscription).
+
 ## Quick Start
 
 ### 1. Get API Keys
