@@ -1,5 +1,6 @@
 import http from "node:http";
 import crypto from "node:crypto";
+import { execSync } from "node:child_process";
 
 process.on("uncaughtException", (err) => {
   console.error("[proxy] uncaught exception:", err.message);
@@ -13,7 +14,11 @@ const MINIMAX_BASE = process.env.MINIMAX_BASE_URL || "https://api.minimax.io/v1"
 const MINIMAX_KEY = process.env.MINIMAX_API_KEY;
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
-const OPENROUTER_SEARCH_MODEL = process.env.OPENROUTER_SEARCH_MODEL || "nvidia/nemotron-3-super-120b-a12b:free";
+const OPENROUTER_SEARCH_MODEL = process.env.OPENROUTER_SEARCH_MODEL || "google/gemini-3-flash-preview";
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || (() => {
+  try { return execSync("gh auth token", { encoding: "utf-8", timeout: 3000 }).trim(); }
+  catch { return ""; }
+})();
 
 if (!MINIMAX_KEY) {
   console.error("MINIMAX_API_KEY env var is required");
@@ -29,6 +34,74 @@ const responseStore = new Map();
 const STORE_TTL = 60 * 60 * 1000; // 1 hour
 const STORE_MAX = 500;
 const MAX_CONSECUTIVE_TOOL_CALLS = 20; // circuit breaker threshold
+
+// --- Proxy-side web_fetch tool (bypasses sandbox restrictions) ---
+
+const WEB_FETCH_TOOL = {
+  type: "function",
+  function: {
+    name: "web_fetch",
+    description: "Fetch content from a URL over HTTP/HTTPS. Use this when you need to retrieve content from a web URL. Returns HTTP status and response body. Supports all HTTP methods.",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The URL to fetch (http:// or https://)" },
+        method: { type: "string", enum: ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], description: "HTTP method (default: GET)" },
+        headers: { type: "object", description: "Optional HTTP headers as key-value pairs" },
+        body: { type: "string", description: "Request body for POST/PUT/PATCH requests" },
+      },
+      required: ["url"],
+    },
+  },
+};
+
+const MAX_FETCH_LOOPS = 5;
+const FETCH_TIMEOUT = 15000; // 15s per fetch
+const FETCH_MAX_BODY = 50000; // max chars returned
+
+async function executeWebFetch(argsStr) {
+  try {
+    const args = typeof argsStr === "string" ? JSON.parse(argsStr) : argsStr;
+    const { url, method = "GET", headers = {}, body: reqBody } = args;
+    if (!url) return "Error: no URL provided";
+
+    if (!headers["User-Agent"]) headers["User-Agent"] = "Mozilla/5.0 (compatible; CodexProxy/1.0)";
+
+    // Auto-inject GitHub auth for API calls (prevents 404 on private repos and rate limits)
+    if (GITHUB_TOKEN && /api\.github\.com/.test(url) && !headers["Authorization"] && !headers["authorization"]) {
+      headers["Authorization"] = `Bearer ${GITHUB_TOKEN}`;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+    const fetchOpts = { method, headers, signal: controller.signal, redirect: "follow" };
+    if (reqBody && /^(POST|PUT|PATCH)$/i.test(method)) fetchOpts.body = reqBody;
+
+    const response = await fetch(url, fetchOpts);
+    clearTimeout(timeout);
+
+    const ct = response.headers.get("content-type") || "";
+    const status = `HTTP ${response.status} ${response.statusText}`;
+
+    if (/^(HEAD|OPTIONS)$/i.test(method)) {
+      const hdrs = [...response.headers.entries()].map(([k, v]) => `${k}: ${v}`).join("\n");
+      return `${status}\n${hdrs}`;
+    }
+
+    if (/image|audio|video|octet-stream/.test(ct)) {
+      return `${status}\nContent-Type: ${ct}\n(binary content, not shown)`;
+    }
+
+    let text = await response.text();
+    if (text.length > FETCH_MAX_BODY) {
+      text = text.slice(0, FETCH_MAX_BODY) + `\n...[truncated, ${text.length - FETCH_MAX_BODY} chars omitted]`;
+    }
+    return `${status}\n\n${text}`;
+  } catch (err) {
+    if (err.name === "AbortError") return "Fetch error: request timed out (15s)";
+    return `Fetch error: ${err.message}`;
+  }
+}
 
 function storeResponse(id, data) {
   // Evict expired entries periodically
@@ -717,6 +790,48 @@ function sendCompletion(res, events, responseId, model, fullText, toolCalls, out
   return finalOutput;
 }
 
+// --- Send a completed response as simulated SSE stream ---
+
+function sendResponseAsStream(res, response) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  const events = buildStreamingResponseEvents(response.id, response.model, response.previous_response_id, response.metadata);
+  res.write(events.created());
+  res.write(events.inProgress());
+
+  for (let i = 0; i < response.output.length; i++) {
+    const item = response.output[i];
+    if (item.type === "function_call") {
+      res.write(events.outputItemAdded(i, { ...item, status: "in_progress", arguments: "" }));
+      res.write(events.fnCallArgsDelta(i, item.call_id, item.arguments));
+      res.write(events.fnCallArgsDone(i, item.call_id, item.arguments));
+      res.write(events.outputItemDone(i, item));
+    } else if (item.type === "message") {
+      res.write(events.outputItemAdded(i, { ...item, status: "in_progress", content: [] }));
+      for (let ci = 0; ci < item.content.length; ci++) {
+        const part = item.content[ci];
+        if (part.type === "output_text") {
+          res.write(events.contentPartAdded(i, ci, { type: "output_text", text: "", annotations: [] }));
+          const text = part.text;
+          for (let c = 0; c < text.length; c += 80) {
+            res.write(events.textDelta(i, ci, text.slice(c, c + 80)));
+          }
+          res.write(events.textDone(i, ci, text));
+          res.write(events.contentPartDone(i, ci, part));
+        }
+      }
+      res.write(events.outputItemDone(i, item));
+    }
+  }
+
+  res.write(events.completed(response));
+  res.end();
+}
+
 // --- HTTP server ---
 
 const server = http.createServer(async (req, res) => {
@@ -785,23 +900,44 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // Only route to OpenRouter if the ONLY tools are non-function (e.g. web_search alone)
-    // If there are function tools too, use MiniMax and just strip web_search
-    const hasWebSearch = body.tools?.some((t) => t.type === "web_search");
+    // Route to OpenRouter whenever web_search is requested (even alongside function tools).
+    // OpenRouter handles both web search (via plugins) and function calling.
+    const hasWebSearch = body.tools?.some((t) => t.type === "web_search" || t.type === "web_search_preview");
     const hasFunctionTools = body.tools?.some((t) => t.type === "function");
-    const useOpenRouter = hasWebSearch && !hasFunctionTools && OPENROUTER_KEY;
+    const useOpenRouter = hasWebSearch && OPENROUTER_KEY;
+
+    if (hasWebSearch && !OPENROUTER_KEY) {
+      console.warn("[proxy] web_search requested but OPENROUTER_API_KEY not set — web search will be dropped");
+    }
 
     const chatReq = responsesRequestToChatCompletions(body);
     // Always override model to MiniMax-M2.7 (subagents may send different model names)
     chatReq.model = "MiniMax-M2.7";
     const isStream = chatReq.stream;
 
-    // Route to OpenRouter for pure web search, MiniMax for everything else
+    // Route to OpenRouter for web search, MiniMax for everything else
     let upstreamUrl, upstreamKey, routeLabel;
     if (useOpenRouter) {
       chatReq.model = OPENROUTER_SEARCH_MODEL;
       // OpenRouter uses plugins for web search
       chatReq.plugins = [{ id: "web", max_results: 5 }];
+      // Remove reasoning_split (MiniMax-specific) — not applicable for OpenRouter
+      delete chatReq.reasoning_split;
+      // Ensure function tools are included for OpenRouter (it supports both web search + tools)
+      if (hasFunctionTools && (!chatReq.tools || chatReq.tools.length === 0)) {
+        const supported = body.tools.filter((t) => t.type === "function");
+        if (supported.length > 0) {
+          chatReq.tools = supported.map((t) => {
+            if (!t.function) {
+              return {
+                type: "function",
+                function: { name: t.name, description: t.description, parameters: t.parameters },
+              };
+            }
+            return t;
+          });
+        }
+      }
       upstreamUrl = `${OPENROUTER_BASE}/chat/completions`;
       upstreamKey = OPENROUTER_KEY;
       routeLabel = `openrouter(${OPENROUTER_SEARCH_MODEL})`;
@@ -822,50 +958,175 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    console.log(`[proxy] ${routeLabel} | stream=${isStream} | messages=${chatReq.messages.length}${hasWebSearch ? " | web_search" : ""} | roles=[${chatReq.messages.map(m => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`);
+    // Check if conversation contains URLs — only inject web_fetch tool in that case
+    // to preserve streaming performance for normal coding requests
+    const conversationHasUrls = chatReq.messages.some(m =>
+      typeof m.content === "string" && /https?:\/\//.test(m.content)
+    );
+
+    if (conversationHasUrls) {
+      if (!chatReq.tools) chatReq.tools = [];
+      chatReq.tools.push(WEB_FETCH_TOOL);
+      // Nudge the model to use web_fetch instead of curl/wget (which aren't available in the sandbox)
+      chatReq.messages.push({
+        role: "user",
+        content: "[System: You have a `web_fetch` tool available for making HTTP requests. Use it instead of curl, wget, or other shell-based HTTP tools. Call web_fetch with {\"url\": \"...\"} to fetch any URL. It supports GET, HEAD, POST, PUT, DELETE, PATCH, and OPTIONS methods.]",
+      });
+    }
 
     // Add MiniMax-specific params when routing to MiniMax
     if (!useOpenRouter) {
-      chatReq.reasoning_split = true; // separate thinking from content (no <think> tags)
+      chatReq.reasoning_split = true;
     }
 
+    console.log(`[proxy] ${routeLabel} | stream=${isStream} | messages=${chatReq.messages.length}${hasWebSearch ? " | web_search" : ""}${conversationHasUrls ? " | web_fetch_injected" : ""} | roles=[${chatReq.messages.map(m => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`);
+
     try {
-      const upstreamRes = await fetch(upstreamUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${upstreamKey}`,
-        },
-        body: JSON.stringify(chatReq),
-      });
+      // If web_fetch is injected, use non-streaming loop to resolve proxy-side fetches
+      if (conversationHasUrls) {
+        let loopMessages = [...chatReq.messages];
+        let finalCcResponse = null;
+        let fetchLoopCount = 0;
+        const fetchCache = new Map(); // url -> response content (dedup within this loop sequence)
+        let prevFetchUrls = ""; // track previous loop's URLs to detect stuck loops
 
-      if (!upstreamRes.ok) {
-        const errText = await upstreamRes.text();
-        console.error(`[proxy] upstream error: ${upstreamRes.status} ${errText}`);
-        if (!res.headersSent) {
-          res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
-          res.end(errText);
+        for (let loop = 0; loop <= MAX_FETCH_LOOPS; loop++) {
+          const loopReq = { ...chatReq, messages: loopMessages, stream: false };
+
+          const upstreamRes = await fetch(upstreamUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${upstreamKey}`,
+            },
+            body: JSON.stringify(loopReq),
+          });
+
+          if (!upstreamRes.ok) {
+            const errText = await upstreamRes.text();
+            console.error(`[proxy] upstream error: ${upstreamRes.status} ${errText}`);
+            if (!res.headersSent) {
+              res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+              res.end(errText);
+            }
+            return;
+          }
+
+          const ccResponse = await upstreamRes.json();
+          const msg = ccResponse.choices?.[0]?.message;
+          const webFetchCalls = (msg?.tool_calls || []).filter(tc => tc.function?.name === "web_fetch");
+
+          // Detect stuck loops: if model requests the exact same URLs as last loop, break early
+          const currentFetchUrls = webFetchCalls.map(tc => {
+            try { return JSON.parse(tc.function.arguments).url; } catch { return ""; }
+          }).sort().join("|");
+
+          const isStuckLoop = webFetchCalls.length > 0 && currentFetchUrls === prevFetchUrls;
+
+          if (webFetchCalls.length === 0 || loop === MAX_FETCH_LOOPS || isStuckLoop) {
+            if (isStuckLoop) {
+              console.warn(`[proxy] web_fetch loop stuck — model re-requested same URL(s), breaking early at loop ${loop + 1}`);
+            }
+            if (loop === MAX_FETCH_LOOPS && webFetchCalls.length > 0) {
+              console.warn(`[proxy] web_fetch MAX_FETCH_LOOPS (${MAX_FETCH_LOOPS}) exhausted — model still requesting fetches, stripping them`);
+            }
+            // Strip any lingering web_fetch calls from final response (client doesn't know about them)
+            if (msg?.tool_calls) {
+              msg.tool_calls = msg.tool_calls.filter(tc => tc.function?.name !== "web_fetch");
+              if (msg.tool_calls.length === 0) {
+                delete msg.tool_calls;
+                // If finish_reason was tool_calls but we stripped them all, change to stop
+                if (ccResponse.choices[0].finish_reason === "tool_calls") {
+                  ccResponse.choices[0].finish_reason = "stop";
+                }
+              }
+            }
+            finalCcResponse = ccResponse;
+            fetchLoopCount = loop;
+            break;
+          }
+
+          prevFetchUrls = currentFetchUrls;
+
+          // Execute web_fetch calls proxy-side (with URL dedup cache)
+          console.log(`[proxy] executing ${webFetchCalls.length} web_fetch call(s) (loop ${loop + 1}/${MAX_FETCH_LOOPS})`);
+          const results = await Promise.all(webFetchCalls.map(async (tc) => {
+            const fetchUrl = (() => { try { return JSON.parse(tc.function.arguments).url; } catch { return "unknown"; } })();
+            if (fetchCache.has(fetchUrl)) {
+              console.log(`[proxy] web_fetch ${fetchUrl} -> ${fetchCache.get(fetchUrl).length} chars (cached)`);
+              return { role: "tool", tool_call_id: tc.id, content: fetchCache.get(fetchUrl) };
+            }
+            const content = await executeWebFetch(tc.function.arguments);
+            fetchCache.set(fetchUrl, content);
+            console.log(`[proxy] web_fetch ${fetchUrl} -> ${content.length} chars`);
+            return { role: "tool", tool_call_id: tc.id, content };
+          }));
+
+          // Extend conversation with only web_fetch calls + results (drop other tool calls)
+          loopMessages = [
+            ...loopMessages,
+            { role: "assistant", content: null, tool_calls: webFetchCalls },
+            ...results,
+          ];
         }
-        return;
-      }
 
-      if (isStream) {
-        const { responseId: streamRespId, output: streamOutput } = await handleStreamingResponse(upstreamRes, res, body.model, body.previous_response_id, body.metadata);
-        storeResponse(streamRespId, {
-          input: originalInput,
-          output: streamOutput,
-          previousResponseId: body.previous_response_id || null,
-        });
-      } else {
-        const ccResponse = await upstreamRes.json();
-        const responsesResponse = chatCompletionToResponse(ccResponse, body.model, body.previous_response_id, body.metadata);
+        if (fetchLoopCount > 0) {
+          console.log(`[proxy] web_fetch resolved after ${fetchLoopCount} loop(s)`);
+        }
+
+        // Send final response to client
+        const responsesResponse = chatCompletionToResponse(finalCcResponse, body.model, body.previous_response_id, body.metadata);
         storeResponse(responsesResponse.id, {
           input: originalInput,
           output: responsesResponse.output,
           previousResponseId: body.previous_response_id || null,
         });
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(responsesResponse));
+
+        if (isStream) {
+          sendResponseAsStream(res, responsesResponse);
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(responsesResponse));
+        }
+      } else {
+        // Normal path — no web_fetch, preserve streaming
+        const upstreamRes = await fetch(upstreamUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${upstreamKey}`,
+          },
+          body: JSON.stringify(chatReq),
+        });
+
+        if (!upstreamRes.ok) {
+          const errText = await upstreamRes.text();
+          console.error(`[proxy] upstream error: ${upstreamRes.status} ${errText}`);
+          if (!res.headersSent) {
+            res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+            res.end(errText);
+          }
+          return;
+        }
+
+        if (isStream) {
+          const { responseId: streamRespId, output: streamOutput } = await handleStreamingResponse(upstreamRes, res, body.model, body.previous_response_id, body.metadata);
+          storeResponse(streamRespId, {
+            input: originalInput,
+            output: streamOutput,
+            previousResponseId: body.previous_response_id || null,
+          });
+        } else {
+          const ccResponse = await upstreamRes.json();
+          const responsesResponse = chatCompletionToResponse(ccResponse, body.model, body.previous_response_id, body.metadata);
+          storeResponse(responsesResponse.id, {
+            input: originalInput,
+            output: responsesResponse.output,
+            previousResponseId: body.previous_response_id || null,
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(responsesResponse));
+        }
       }
     } catch (err) {
       console.error(`[proxy] fetch error:`, err.message);
@@ -998,10 +1259,25 @@ const server = http.createServer(async (req, res) => {
     body.reasoning_split = true;
     if (!body.max_tokens) body.max_tokens = 16384;
 
-    console.log(`[proxy] chat/completions | stream=${isStream} | messages=${validated.length} | roles=[${validated.map(m => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`);
+    // Inject proxy-side web_fetch tool when conversation contains URLs
+    const ccHasUrls = validated.some(m =>
+      (typeof m.content === "string" && /https?:\/\//.test(m.content)) ||
+      (Array.isArray(m.content) && m.content.some(p => typeof p === "string" ? /https?:\/\//.test(p) : p?.text ? /https?:\/\//.test(p.text) : false))
+    );
+
+    if (ccHasUrls) {
+      if (!body.tools) body.tools = [];
+      body.tools.push(WEB_FETCH_TOOL);
+      body.messages.push({
+        role: "user",
+        content: "[System: You have a `web_fetch` tool available for making HTTP requests. Use it instead of curl, wget, or other shell-based HTTP tools. Call web_fetch with {\"url\": \"...\"} to fetch any URL. It supports GET, HEAD, POST, PUT, DELETE, PATCH, and OPTIONS methods.]",
+      });
+    }
+
+    console.log(`[proxy] chat/completions | stream=${isStream} | messages=${body.messages.length}${ccHasUrls ? " | web_fetch_injected" : ""} | roles=[${body.messages.map(m => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`);
 
     // Debug: log tool_calls details
-    for (const msg of validated) {
+    for (const msg of body.messages) {
       if (msg.role === "assistant" && msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           console.log(`[proxy] tool_call: id=${tc.id} fn=${tc.function?.name} args=${(tc.function?.arguments || "").slice(0, 200)}`);
@@ -1010,39 +1286,161 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const upstreamRes = await fetch(`${MINIMAX_BASE}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${MINIMAX_KEY}`,
-        },
-        body: JSON.stringify(body),
-      });
+      // If web_fetch is injected, use non-streaming loop to resolve proxy-side fetches
+      if (ccHasUrls) {
+        let loopMessages = [...body.messages];
+        let finalCcResponse = null;
+        let fetchLoopCount = 0;
+        const fetchCache = new Map(); // url -> response content (dedup within this loop sequence)
+        let prevFetchUrls = ""; // track previous loop's URLs to detect stuck loops
 
-      if (!upstreamRes.ok) {
-        const errText = await upstreamRes.text();
-        console.error(`[proxy] upstream error: ${upstreamRes.status} ${errText}`);
-        if (!res.headersSent) {
-          res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
-          res.end(errText);
-        }
-        return;
-      }
+        for (let loop = 0; loop <= MAX_FETCH_LOOPS; loop++) {
+          const loopBody = { ...body, messages: loopMessages, stream: false };
 
-      if (isStream) {
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-        });
-        for await (const chunk of upstreamRes.body) {
-          res.write(chunk);
+          const upstreamRes = await fetch(`${MINIMAX_BASE}/chat/completions`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${MINIMAX_KEY}`,
+            },
+            body: JSON.stringify(loopBody),
+          });
+
+          if (!upstreamRes.ok) {
+            const errText = await upstreamRes.text();
+            console.error(`[proxy] upstream error: ${upstreamRes.status} ${errText}`);
+            if (!res.headersSent) {
+              res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+              res.end(errText);
+            }
+            return;
+          }
+
+          const ccResponse = await upstreamRes.json();
+          const msg = ccResponse.choices?.[0]?.message;
+          const webFetchCalls = (msg?.tool_calls || []).filter(tc => tc.function?.name === "web_fetch");
+
+          // Detect stuck loops: if model requests the exact same URLs as last loop, break early
+          const currentFetchUrls = webFetchCalls.map(tc => {
+            try { return JSON.parse(tc.function.arguments).url; } catch { return ""; }
+          }).sort().join("|");
+
+          const isStuckLoop = webFetchCalls.length > 0 && currentFetchUrls === prevFetchUrls;
+
+          if (webFetchCalls.length === 0 || loop === MAX_FETCH_LOOPS || isStuckLoop) {
+            if (isStuckLoop) {
+              console.warn(`[proxy] cc: web_fetch loop stuck — model re-requested same URL(s), breaking early at loop ${loop + 1}`);
+            }
+            if (loop === MAX_FETCH_LOOPS && webFetchCalls.length > 0) {
+              console.warn(`[proxy] cc: web_fetch MAX_FETCH_LOOPS (${MAX_FETCH_LOOPS}) exhausted — stripping remaining fetches`);
+            }
+            // Strip web_fetch calls from final response
+            if (msg?.tool_calls) {
+              msg.tool_calls = msg.tool_calls.filter(tc => tc.function?.name !== "web_fetch");
+              if (msg.tool_calls.length === 0) {
+                delete msg.tool_calls;
+                if (ccResponse.choices[0].finish_reason === "tool_calls") {
+                  ccResponse.choices[0].finish_reason = "stop";
+                }
+              }
+            }
+            finalCcResponse = ccResponse;
+            fetchLoopCount = loop;
+            break;
+          }
+
+          prevFetchUrls = currentFetchUrls;
+
+          // Execute web_fetch calls proxy-side (with URL dedup cache)
+          console.log(`[proxy] cc: executing ${webFetchCalls.length} web_fetch call(s) (loop ${loop + 1}/${MAX_FETCH_LOOPS})`);
+          const results = await Promise.all(webFetchCalls.map(async (tc) => {
+            const fetchUrl = (() => { try { return JSON.parse(tc.function.arguments).url; } catch { return "unknown"; } })();
+            if (fetchCache.has(fetchUrl)) {
+              console.log(`[proxy] cc: web_fetch ${fetchUrl} -> ${fetchCache.get(fetchUrl).length} chars (cached)`);
+              return { role: "tool", tool_call_id: tc.id, content: fetchCache.get(fetchUrl) };
+            }
+            const content = await executeWebFetch(tc.function.arguments);
+            fetchCache.set(fetchUrl, content);
+            console.log(`[proxy] cc: web_fetch ${fetchUrl} -> ${content.length} chars`);
+            return { role: "tool", tool_call_id: tc.id, content };
+          }));
+
+          loopMessages = [
+            ...loopMessages,
+            { role: "assistant", content: null, tool_calls: webFetchCalls },
+            ...results,
+          ];
         }
-        res.end();
+
+        if (fetchLoopCount > 0) {
+          console.log(`[proxy] cc: web_fetch resolved after ${fetchLoopCount} loop(s)`);
+        }
+
+        // Send final response as streaming SSE or JSON
+        if (isStream) {
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+          // Simulate SSE from the complete response
+          const msg = finalCcResponse.choices?.[0]?.message;
+          // Send tool_calls as deltas
+          if (msg?.tool_calls) {
+            for (let i = 0; i < msg.tool_calls.length; i++) {
+              const tc = msg.tool_calls[i];
+              res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] } }] })}\n\n`);
+              res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }] } }] })}\n\n`);
+            }
+          }
+          // Send content
+          if (msg?.content) {
+            res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: msg.content } }] })}\n\n`);
+          }
+          // Send finish
+          res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: finalCcResponse.choices[0].finish_reason }], usage: finalCcResponse.usage })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(finalCcResponse));
+        }
       } else {
-        const data = await upstreamRes.json();
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(data));
+        // Normal path — no web_fetch, preserve streaming
+        const upstreamRes = await fetch(`${MINIMAX_BASE}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${MINIMAX_KEY}`,
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (!upstreamRes.ok) {
+          const errText = await upstreamRes.text();
+          console.error(`[proxy] upstream error: ${upstreamRes.status} ${errText}`);
+          if (!res.headersSent) {
+            res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+            res.end(errText);
+          }
+          return;
+        }
+
+        if (isStream) {
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+          for await (const chunk of upstreamRes.body) {
+            res.write(chunk);
+          }
+          res.end();
+        } else {
+          const data = await upstreamRes.json();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(data));
+        }
       }
     } catch (err) {
       console.error(`[proxy] fetch error:`, err.message);
@@ -1071,4 +1469,5 @@ server.listen(PORT, () => {
   console.log(`[codex-minimax-proxy] Listening on http://localhost:${PORT}`);
   console.log(`[codex-minimax-proxy] Primary: MiniMax @ ${MINIMAX_BASE}`);
   console.log(`[codex-minimax-proxy] Search:  ${OPENROUTER_KEY ? `OpenRouter (${OPENROUTER_SEARCH_MODEL})` : "DISABLED (no OPENROUTER_API_KEY)"}`);
+  console.log(`[codex-minimax-proxy] GitHub:  ${GITHUB_TOKEN ? "authenticated" : "anonymous (set GITHUB_TOKEN or install gh CLI)"}`);
 });
