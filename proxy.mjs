@@ -14,7 +14,7 @@ const MINIMAX_BASE = process.env.MINIMAX_BASE_URL || "https://api.minimax.io/v1"
 const MINIMAX_KEY = process.env.MINIMAX_API_KEY;
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
-const OPENROUTER_SEARCH_MODEL = process.env.OPENROUTER_SEARCH_MODEL || "qwen/qwen3-coder:free";
+const OPENROUTER_SEARCH_MODEL = process.env.OPENROUTER_SEARCH_MODEL || "nvidia/nemotron-3-super-120b-a12b:free";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || (() => {
   try { return execSync("gh auth token", { encoding: "utf-8", timeout: 3000 }).trim(); }
   catch { return ""; }
