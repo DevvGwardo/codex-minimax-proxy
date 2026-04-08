@@ -1,11 +1,17 @@
 {
   "name": "codex-minimax-proxy",
   "version": "1.0.0",
-  "description": "Proxy that translates OpenAI Responses API to Chat Completions API, enabling MiniMax M2.7 to work with OpenAI Codex CLI and Codex App",
+  "description": "Multi-provider Codex proxy: routes OpenAI Responses natively and translates MiniMax Chat Completions behind a single local base URL",
   "main": "proxy.mjs",
   "type": "module",
   "scripts": {
-    "start": "node proxy.mjs"
+    "start": "node proxy.mjs",
+    "codex:gpt": "./scripts/codex-gpt.sh",
+    "codex:minimax": "./scripts/codex-minimax.sh",
+    "codex:app:gpt": "./scripts/codex-app-gpt.sh",
+    "codex:app:minimax": "./scripts/codex-app-minimax.sh",
+    "install:launchers:mac": "./scripts/install-macos-launchers.sh",
+    "install:launchers:windows": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File ./scripts/install-windows-launchers.ps1"
   },
   "keywords": [
     "minimax",
