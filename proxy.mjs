@@ -22,6 +22,8 @@ const OPENAI_MODEL_PREFIXES = parseCsv(process.env.OPENAI_MODEL_PREFIXES || "gpt
 
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const OPENROUTER_MODELS = parseCsv(process.env.OPENROUTER_MODELS || "");
+const OPENROUTER_MODEL_PREFIXES = parseCsv(process.env.OPENROUTER_MODEL_PREFIXES || "");
 const OPENROUTER_SEARCH_MODEL = process.env.OPENROUTER_SEARCH_MODEL || "nvidia/nemotron-3-super-120b-a12b:free";
 
 const DEFAULT_PROVIDER = (process.env.DEFAULT_PROVIDER || "").trim().toLowerCase();
@@ -41,19 +43,23 @@ if (!OPENROUTER_KEY) {
 const enabledProviders = new Set();
 if (MINIMAX_KEY) enabledProviders.add("minimax");
 if (OPENAI_KEY) enabledProviders.add("openai");
+if (OPENROUTER_KEY && OPENROUTER_MODELS.length > 0) enabledProviders.add("openrouter");
 
 const providerModels = {
   minimax: MINIMAX_MODELS,
   openai: OPENAI_MODELS,
+  openrouter: OPENROUTER_MODELS,
 };
 
 const explicitModelProvider = new Map();
 for (const model of MINIMAX_MODELS) explicitModelProvider.set(normalizeModelId(model), "minimax");
 for (const model of OPENAI_MODELS) explicitModelProvider.set(normalizeModelId(model), "openai");
+for (const model of OPENROUTER_MODELS) explicitModelProvider.set(normalizeModelId(model), "openrouter");
 
 const modelCatalog = [
   ...MINIMAX_MODELS.map((id) => ({ id, object: "model", owned_by: "minimax" })),
   ...OPENAI_MODELS.map((id) => ({ id, object: "model", owned_by: "openai" })),
+  ...OPENROUTER_MODELS.map((id) => ({ id, object: "model", owned_by: "openrouter" })),
 ];
 
 // --- Response store for previous_response_id bridging ---
@@ -215,6 +221,7 @@ function ensureWebFetchHint(messages) {
 function getFallbackProvider() {
   if (DEFAULT_PROVIDER && enabledProviders.has(DEFAULT_PROVIDER)) return DEFAULT_PROVIDER;
   if (enabledProviders.has("openai")) return "openai";
+  if (enabledProviders.has("openrouter")) return "openrouter";
   if (enabledProviders.has("minimax")) return "minimax";
   throw new Error("No providers are enabled");
 }
@@ -228,6 +235,12 @@ function resolveProviderForModel(model) {
     if (enabledProviders.has("openai")) {
       const looksOpenAI = OPENAI_MODEL_PREFIXES.some((prefix) => normalized.startsWith(prefix.toLowerCase()));
       if (looksOpenAI) return "openai";
+    }
+    if (enabledProviders.has("openrouter")) {
+      const looksOpenRouter =
+        OPENROUTER_MODEL_PREFIXES.some((prefix) => normalized.startsWith(prefix.toLowerCase())) ||
+        normalized.includes("/");
+      if (looksOpenRouter) return "openrouter";
     }
   }
   return getFallbackProvider();
@@ -530,6 +543,106 @@ function responsesRequestToChatCompletions(body) {
   if (body.reasoning?.effort) req.reasoning_effort = body.reasoning.effort;
   if (body.parallel_tool_calls != null) req.parallel_tool_calls = body.parallel_tool_calls;
 
+  return req;
+}
+
+function responsesRequestToOpenAICompatibleChatCompletions(body) {
+  const messages = [];
+
+  if (body.instructions) {
+    messages.push({ role: "system", content: body.instructions });
+  }
+
+  if (typeof body.input === "string") {
+    messages.push({ role: "user", content: body.input });
+  } else if (Array.isArray(body.input)) {
+    let pendingToolCalls = [];
+
+    for (const item of body.input) {
+      if (item.type === "message") {
+        const role = item.role === "developer" ? "system" : item.role;
+        let content;
+
+        if (typeof item.content === "string") {
+          content = item.content;
+        } else if (Array.isArray(item.content)) {
+          content = item.content.map((block) => {
+            if (block.type === "input_text") return { type: "text", text: block.text };
+            if (block.type === "output_text") return { type: "text", text: block.text };
+            if (block.type === "input_image") {
+              return { type: "image_url", image_url: { url: block.image_url || block.url } };
+            }
+            return block;
+          });
+          if (content.length === 1 && content[0].type === "text") {
+            content = content[0].text;
+          }
+        }
+
+        if (pendingToolCalls.length > 0 && role === "assistant") {
+          messages.push({ role: "assistant", content: null, tool_calls: pendingToolCalls });
+          pendingToolCalls = [];
+        } else {
+          if (pendingToolCalls.length > 0) {
+            messages.push({ role: "assistant", content: null, tool_calls: pendingToolCalls });
+            pendingToolCalls = [];
+          }
+          messages.push({ role, content });
+        }
+      } else if (item.type === "function_call") {
+        pendingToolCalls.push({
+          id: item.call_id || item.id,
+          type: "function",
+          function: { name: item.name, arguments: item.arguments },
+        });
+      } else if (item.type === "function_call_output") {
+        if (pendingToolCalls.length > 0) {
+          messages.push({ role: "assistant", content: null, tool_calls: pendingToolCalls });
+          pendingToolCalls = [];
+        }
+        messages.push({ role: "tool", tool_call_id: item.call_id, content: item.output });
+      }
+    }
+
+    if (pendingToolCalls.length > 0) {
+      messages.push({ role: "assistant", content: null, tool_calls: pendingToolCalls });
+    }
+  }
+
+  const req = {
+    model: body.model,
+    messages,
+    stream: body.stream || false,
+  };
+
+  if (body.temperature != null) req.temperature = body.temperature;
+  if (body.top_p != null) req.top_p = body.top_p;
+  req.max_tokens = body.max_output_tokens || 16384;
+
+  if (body.tools?.length > 0) {
+    const supported = body.tools.filter((t) => t.type === "function");
+    if (supported.length > 0) {
+      req.tools = supported.map((t) => {
+        if (!t.function) {
+          return {
+            type: "function",
+            function: { name: t.name, description: t.description, parameters: t.parameters },
+          };
+        }
+        return t;
+      });
+    }
+  }
+
+  if (body.tool_choice != null) {
+    if (typeof body.tool_choice === "object" && body.tool_choice.name) {
+      req.tool_choice = { type: "function", function: { name: body.tool_choice.name } };
+    } else {
+      req.tool_choice = body.tool_choice;
+    }
+  }
+
+  if (body.parallel_tool_calls != null) req.parallel_tool_calls = body.parallel_tool_calls;
   return req;
 }
 
@@ -1054,6 +1167,36 @@ async function forwardOpenAIChatCompletions(body, res) {
   sendJson(res, upstreamRes.status, response);
 }
 
+async function forwardOpenRouterChatCompletions(body, res) {
+  const upstreamRes = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENROUTER_KEY}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!upstreamRes.ok) {
+    await sendUpstreamError(upstreamRes, res);
+    return;
+  }
+
+  if (body.stream) {
+    res.writeHead(upstreamRes.status, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    for await (const chunk of upstreamRes.body) res.write(chunk);
+    res.end();
+    return;
+  }
+
+  const response = await upstreamRes.json();
+  sendJson(res, upstreamRes.status, response);
+}
+
 // --- MiniMax handlers ---
 
 async function handleMinimaxResponses(body, res, originalInput) {
@@ -1278,6 +1421,60 @@ async function handleMinimaxResponses(body, res, originalInput) {
   const responsesResponse = chatCompletionToResponse(ccResponse, body.model, originalPreviousResponseId, body.metadata);
   storeResponse(responsesResponse.id, {
     provider: "minimax",
+    input: originalInput,
+    output: responsesResponse.output,
+    previousResponseId: originalPreviousResponseId,
+  });
+  sendJson(res, 200, responsesResponse);
+}
+
+async function handleOpenRouterResponses(body, res, originalInput) {
+  if (!OPENROUTER_KEY) {
+    sendJson(res, 400, { error: { message: "OPENROUTER_API_KEY is not configured" } });
+    return;
+  }
+
+  const originalPreviousResponseId = body.previous_response_id || null;
+  maybeResolvePreviousResponseChain(body, "openrouter");
+
+  const chatReq = responsesRequestToOpenAICompatibleChatCompletions(body);
+  chatReq.model = body.model || OPENROUTER_MODELS[0] || OPENROUTER_SEARCH_MODEL;
+
+  const upstreamRes = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENROUTER_KEY}`,
+    },
+    body: JSON.stringify(chatReq),
+  });
+
+  if (!upstreamRes.ok) {
+    await sendUpstreamError(upstreamRes, res);
+    return;
+  }
+
+  if (chatReq.stream) {
+    const { responseId: streamRespId, output: streamOutput } = await handleStreamingResponse(
+      upstreamRes,
+      res,
+      body.model,
+      originalPreviousResponseId,
+      body.metadata
+    );
+    storeResponse(streamRespId, {
+      provider: "openrouter",
+      input: originalInput,
+      output: streamOutput,
+      previousResponseId: originalPreviousResponseId,
+    });
+    return;
+  }
+
+  const ccResponse = await upstreamRes.json();
+  const responsesResponse = chatCompletionToResponse(ccResponse, body.model, originalPreviousResponseId, body.metadata);
+  storeResponse(responsesResponse.id, {
+    provider: "openrouter",
     input: originalInput,
     output: responsesResponse.output,
     previousResponseId: originalPreviousResponseId,
@@ -1594,6 +1791,16 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      if (provider === "openrouter") {
+        if (!OPENROUTER_KEY) {
+          sendJson(res, 400, { error: { message: "OPENROUTER_API_KEY is not configured" } });
+          return;
+        }
+        console.log(`[proxy] responses openrouter(${body.model || OPENROUTER_MODELS[0] || OPENROUTER_SEARCH_MODEL}) | stream=${!!body.stream}`);
+        await handleOpenRouterResponses(body, res, originalInput);
+        return;
+      }
+
       await handleMinimaxResponses(body, res, originalInput);
     } catch (err) {
       console.error("[proxy] responses route error:", err.message);
@@ -1618,6 +1825,16 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      if (provider === "openrouter") {
+        if (!OPENROUTER_KEY) {
+          sendJson(res, 400, { error: { message: "OPENROUTER_API_KEY is not configured" } });
+          return;
+        }
+        console.log(`[proxy] chat/completions openrouter(${body.model || OPENROUTER_MODELS[0] || OPENROUTER_SEARCH_MODEL}) | stream=${!!body.stream}`);
+        await forwardOpenRouterChatCompletions(body, res);
+        return;
+      }
+
       await handleMinimaxChatCompletions(body, res);
     } catch (err) {
       console.error("[proxy] chat/completions route error:", err.message);
@@ -1639,6 +1856,7 @@ server.listen(PORT, () => {
   console.log(`[codex-minimax-proxy] Default provider: ${getFallbackProvider()}`);
   console.log(`[codex-minimax-proxy] MiniMax: ${MINIMAX_KEY ? `${MINIMAX_BASE} | models=${providerModels.minimax.join(", ")}` : "DISABLED"}`);
   console.log(`[codex-minimax-proxy] OpenAI:  ${OPENAI_KEY ? `${OPENAI_BASE} | models=${providerModels.openai.join(", ")}` : "DISABLED"}`);
+  console.log(`[codex-minimax-proxy] OpenRouter routed models: ${OPENROUTER_KEY && providerModels.openrouter.length > 0 ? `${OPENROUTER_BASE} | models=${providerModels.openrouter.join(", ")}` : "DISABLED"}`);
   console.log(`[codex-minimax-proxy] Search:  ${OPENROUTER_KEY ? `OpenRouter (${OPENROUTER_SEARCH_MODEL})` : "DISABLED (no OPENROUTER_API_KEY)"}`);
   console.log(`[codex-minimax-proxy] GitHub:  ${GITHUB_TOKEN ? "authenticated" : "anonymous (set GITHUB_TOKEN or install gh CLI)"}`);
 });

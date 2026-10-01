@@ -21,6 +21,7 @@
 
 - MiniMax models are translated from OpenAI-style Responses API requests into MiniMax Chat Completions.
 - OpenAI models are forwarded natively to OpenAI Responses or Chat Completions.
+- OpenRouter-hosted chat-completions models such as Kimi K2 or MiMo can be routed through the same proxy.
 - URL-heavy MiniMax runs can use a proxy-side `web_fetch` tool instead of getting stuck trying shell HTTP tools.
 
 This is useful when you want MiniMax available inside Codex without giving up normal GPT-family workflows.
@@ -35,7 +36,9 @@ flowchart LR
     D --> E[MiniMax API]
     C -->|OpenAI model| F[Native Responses / Chat Completions pass-through]
     F --> G[OpenAI API]
-    D -. optional web_search .-> H[OpenRouter web model]
+    C -->|OpenRouter model| H[Responses -> Chat Completions translation]
+    H --> J[OpenRouter API]
+    D -. optional web_search .-> K[OpenRouter web model]
     D -. optional URL fetch .-> I[Proxy-side web_fetch]
 ```
 
@@ -77,6 +80,7 @@ If your goal is "keep using my normal Codex plan and also have MiniMax available
 - MiniMax Responses -> Chat Completions translation
 - OpenAI Responses pass-through
 - OpenAI Chat Completions pass-through
+- OpenRouter-hosted Chat Completions routing
 - Model-based provider routing
 - Combined `/v1/models` model catalog
 - Streaming support on both routing paths
@@ -102,9 +106,14 @@ Set at least one upstream key:
 ```bash
 export MINIMAX_API_KEY="..."
 export OPENAI_API_KEY="..."
+export OPENROUTER_API_KEY="..."
 ```
 
-You can set one or both. If both are present, the proxy can route by model name.
+You can set any combination of these. If you want Kimi K2, MiMo, or other OpenRouter models, also set:
+
+```bash
+export OPENROUTER_MODELS="moonshotai/kimi-k2,xiaomi/mimo-v2-omni"
+```
 
 ### 2. Start the proxy
 
@@ -169,6 +178,18 @@ In this mode the proxy uses its own upstream environment variables:
 
 - `MINIMAX_API_KEY` for MiniMax models
 - `OPENAI_API_KEY` for OpenAI models
+- `OPENROUTER_API_KEY` for routed OpenRouter models
+
+### Option C: Add OpenRouter-hosted models as extra choices
+
+This is the easiest way to add Kimi K2 and MiMo without adding another provider block to Codex.
+
+```bash
+export OPENROUTER_API_KEY="..."
+export OPENROUTER_MODELS="moonshotai/kimi-k2,xiaomi/mimo-v2-omni"
+```
+
+Then point Codex at the proxy and select those model ids directly.
 
 ## Routing Rules
 
@@ -178,20 +199,23 @@ The proxy advertises and routes models from:
 
 - `MINIMAX_MODELS`
 - `OPENAI_MODELS`
+- `OPENROUTER_MODELS`
 
 Default values:
 
 ```text
 MINIMAX_MODELS=MiniMax-M2.7
 OPENAI_MODELS=gpt-5.4,gpt-5.4-mini,gpt-5.4-nano,gpt-4o
+OPENROUTER_MODELS=moonshotai/kimi-k2,xiaomi/mimo-v2-omni
 ```
 
 ### Prefix routing
 
-If a model is not explicitly listed, it can still route to OpenAI by prefix:
+If a model is not explicitly listed, it can still route by prefix:
 
 ```text
 OPENAI_MODEL_PREFIXES=gpt-,o1,o3,o4,codex-,chatgpt-
+OPENROUTER_MODEL_PREFIXES=moonshotai/,xiaomi/
 ```
 
 ### Default provider fallback
@@ -200,7 +224,8 @@ If a request is missing a model or the model is ambiguous, fallback order is:
 
 1. `DEFAULT_PROVIDER`, if set and enabled
 2. OpenAI, if enabled
-3. MiniMax, if enabled
+3. OpenRouter, if enabled
+4. MiniMax, if enabled
 
 ## Configuration
 
@@ -215,7 +240,9 @@ If a request is missing a model or the model is ambiguous, fallback order is:
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI upstream base URL |
 | `OPENAI_MODELS` | `gpt-5.4,gpt-5.4-mini,gpt-5.4-nano,gpt-4o` | Models exposed as OpenAI |
 | `OPENAI_MODEL_PREFIXES` | `gpt-,o1,o3,o4,codex-,chatgpt-` | Prefix heuristics for OpenAI routing |
-| `OPENROUTER_API_KEY` | unset | Optional search fallback for MiniMax `web_search` |
+| `OPENROUTER_API_KEY` | unset | Enables OpenRouter routed models and MiniMax search fallback |
+| `OPENROUTER_MODELS` | unset | OpenRouter model ids to advertise and route, for example `moonshotai/kimi-k2,xiaomi/mimo-v2-omni` |
+| `OPENROUTER_MODEL_PREFIXES` | unset | Prefix heuristics for OpenRouter routing, for example `moonshotai/,xiaomi/` |
 | `OPENROUTER_SEARCH_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter search model |
 | `GITHUB_TOKEN` | auto via `gh auth token` | Used for GitHub API fetches in `/cop` and `web_fetch` |
 
