@@ -1,5 +1,9 @@
 <div align="center">
 
+<p align="center">
+  <img src="assets/banner.jpg" alt="codex-minimax-proxy Banner" />
+</p>
+
 # codex-minimax-proxy
 
 ### One local Codex endpoint for MiniMax translation, OpenAI pass-through, and cleaner tool routing
