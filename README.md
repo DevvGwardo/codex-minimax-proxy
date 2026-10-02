@@ -31,6 +31,10 @@ This is useful when you want MiniMax available inside Codex without giving up no
 
 ## Architecture
 
+<p align="center">
+  <img src="assets/architecture.jpg" alt="codex-minimax-proxy Architectural Flow" />
+</p>
+
 ```mermaid
 flowchart LR
     A[Codex CLI / Codex App] --> B[Local Proxy<br/>http://localhost:4000/v1]
@@ -315,6 +319,10 @@ If a request is missing a model or the model is ambiguous, fallback order is:
 | `POST` | `/v1/chat/completions` | Direct Chat Completions endpoint |
 
 ## MiniMax-Specific Behavior
+
+<p align="center">
+  <img src="assets/routing-pipeline.jpg" alt="codex-minimax-proxy Routing and Execution Pipeline" />
+</p>
 
 When a request routes to MiniMax, the proxy applies MiniMax-oriented normalization:
 
