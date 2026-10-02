@@ -43,6 +43,42 @@ flowchart LR
     D -. optional URL fetch .-> I[Proxy-side web_fetch]
 ```
 
+### Request Lifecycle & Tool Routing
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Codex Client
+    participant Proxy as Local Proxy (:4000)
+    participant Router as Model & Tool Router
+    participant MiniMax as MiniMax API
+    participant OpenAI as OpenAI API
+    participant Web as Web / OpenRouter / Jina
+
+    User->>Proxy: POST /v1/responses (model, input)
+    Proxy->>Router: Inspect model name & prefix
+    alt Model routes to MiniMax (e.g., MiniMax-M2.7)
+        Router->>Router: Flatten developer/system roles to user
+        Router->>Router: Inject reasoning_split & deduplicate web_fetch
+        Router->>MiniMax: POST /v1/chat/completions (translated payload)
+        alt MiniMax issues web_search or URL fetch
+            MiniMax-->>Router: Tool call: web_search / web_fetch
+            Router->>Web: Execute fetch / OpenRouter query
+            Web-->>Router: Markdown / Page content
+            Router->>MiniMax: Send tool result in valid sequence
+            MiniMax-->>Router: Final Assistant reply
+        else Direct Completion
+            MiniMax-->>Router: Stream / Completion tokens
+        end
+        Router-->>Proxy: Format as OpenAI Responses SSE/JSON
+    else Model routes to OpenAI (e.g., gpt-5.4, o3)
+        Router->>OpenAI: Forward native request with OPENAI_API_KEY
+        OpenAI-->>Router: Stream / Completion tokens
+        Router-->>Proxy: Forward response stream
+    end
+    Proxy-->>User: Streaming / Completed Response
+```
+
 ## Recent Updates
 
 Recent commits shifted this repo from a single-model translator into a multi-provider router with stronger tool handling:
@@ -148,6 +184,23 @@ codex -p minimax
 
 ## Usage Modes
 
+```mermaid
+flowchart TD
+    subgraph OptionA["Option A: Hybrid Setup (Recommended)"]
+        direction TB
+        ClientA[Codex CLI] -->|Default: codex| OpenAIDirect["OpenAI Cloud (Native codex login)"]
+        ClientA -->|Profile: codex -p minimax| ProxyA["codex-minimax-proxy (:4000)"]
+        ProxyA --> MiniMaxCloudA["MiniMax Cloud API"]
+    end
+
+    subgraph OptionB["Option B: Full Local Router"]
+        direction TB
+        ClientB[Codex CLI] -->|All traffic via proxy| ProxyB["codex-minimax-proxy (:4000)"]
+        ProxyB -->|gpt-* models| OpenAIDirectB["OpenAI Cloud API (OPENAI_API_KEY)"]
+        ProxyB -->|MiniMax-* models| MiniMaxCloudB["MiniMax Cloud API (MINIMAX_API_KEY)"]
+    end
+```
+
 ### Option A: Native Codex by default, MiniMax as a profile
 
 This is the safest and simplest setup for most people.
@@ -175,6 +228,33 @@ In this mode the proxy uses its own upstream environment variables:
 - `OPENAI_API_KEY` for OpenAI models
 
 ## Routing Rules
+
+### Model Resolution Decision Tree
+
+```mermaid
+flowchart TD
+    Start([Incoming Request]) --> HasModel{Model Specified?}
+    HasModel -->|Yes| CheckMiniMax{Match MINIMAX_MODELS?}
+    HasModel -->|No| CheckDefault{DEFAULT_PROVIDER set?}
+
+    CheckMiniMax -->|Yes| RouteMiniMax[Route to MiniMax API]
+    CheckMiniMax -->|No| CheckOpenAI{Match OPENAI_MODELS?}
+
+    CheckOpenAI -->|Yes| RouteOpenAI[Route to OpenAI API]
+    CheckOpenAI -->|No| CheckPrefix{Match OPENAI_MODEL_PREFIXES?}
+
+    CheckPrefix -->|Yes| RouteOpenAI
+    CheckPrefix -->|No| CheckDefault
+
+    CheckDefault -->|Set & Enabled| RouteDefault[Route to DEFAULT_PROVIDER]
+    CheckDefault -->|Unset / Auto| CheckOpenAIEnabled{OpenAI Key Configured?}
+
+    CheckOpenAIEnabled -->|Yes| RouteOpenAI
+    CheckOpenAIEnabled -->|No| CheckMiniMaxEnabled{MiniMax Key Configured?}
+
+    CheckMiniMaxEnabled -->|Yes| RouteMiniMax
+    CheckMiniMaxEnabled -->|No| Error400[Return 400 Bad Request / No Route]
+```
 
 ### Exact model routing
 
@@ -237,6 +317,27 @@ If a request is missing a model or the model is ambiguous, fallback order is:
 ## MiniMax-Specific Behavior
 
 When a request routes to MiniMax, the proxy applies MiniMax-oriented normalization:
+
+```mermaid
+flowchart LR
+    subgraph Input["Codex Input Payload"]
+        A[Responses API / Chat Spec]
+    end
+
+    subgraph Pipeline["Proxy Normalization Pipeline"]
+        B[Flatten 'developer' & 'system' roles to 'user']
+        C[Reorder tool results immediately after calls]
+        D[Truncate oversized tool outputs & trim context]
+        E[Inject reasoning_split: true]
+        F[Deduplicate & inject proxy-side web_fetch]
+    end
+
+    subgraph Upstream["MiniMax Execution"]
+        G[MiniMax Chat Completions API]
+    end
+
+    A --> B --> C --> D --> E --> F --> G
+```
 
 - `system` and `developer` roles are flattened to `user`
 - tool results are reordered so they directly follow their tool calls
